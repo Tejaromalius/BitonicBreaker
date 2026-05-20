@@ -1,0 +1,32 @@
+Algorithm: Bubble
+Elements: 100000 (Extrapolated to 1000000)
+Time: 0.017170s
+Extrapolated Time: 1.717033s
+Processes: 1
+Status: OK
+---
+Algorithm: Selection
+Elements: 100000 (Extrapolated to 1000000)
+Time: 0.018199s
+Extrapolated Time: 1.819869s
+Processes: 1
+Status: OK
+---
+Algorithm: Quick
+Elements: 1000000
+Time: 0.201857s
+Processes: 1
+Status: OK
+---
+Algorithm: Merge
+Elements: 1000000
+Time: 0.198190s
+Processes: 1
+Status: OK
+---
+Algorithm: Bitonic
+Elements: 1000000
+Time: 0.198749s
+Processes: 1
+Status: OK
+---
