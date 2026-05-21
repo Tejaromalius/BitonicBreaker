@@ -1,7 +1,7 @@
 CXX=g++
 CC=mpicc
 CXXFLAGS=-O2 -Wall -std=c++14
-CFLAGS=-O2 -Wall
+CFLAGS=-O2 -Wall -fopenmp
 
 all: sorting_serial sorting_parallel reports
 

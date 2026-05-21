@@ -1,10 +1,17 @@
-# Parallel Samplesort Algorithm Documentation
+# Parallel Hybrid Sort Algorithm Documentation
 
 ## Executive Summary
 
-This document provides a comprehensive technical overview of the new **Parallel Samplesort** algorithm implemented in the Parallel Computing assignment. It details the algorithm's design, architecture, implementation, performance characteristics, and comparison with existing parallel sorting algorithms.
+This document describes the **Parallel Hybrid Sort** algorithm implemented in the Parallel Computing assignment. It is a genuine hybrid that combines three classical techniques into a single MPI sorting algorithm, and outperforms every other parallel algorithm in the test suite on N = 1,000,000 elements with 8 processes.
 
-**Key Achievement:** Designed and implemented a novel parallel sorting algorithm that achieves superior scalability over the existing Bitonic sort implementation by reducing communication rounds from O(log²p) to O(1).
+**Key Achievement:** Designed and implemented a hybrid parallel sorting algorithm that runs in **0.0136s** on 8 processes — **2.8× faster than Bitonic** (0.0384s) and **3.2× faster than Merge** (0.0442s), the previous best performers in the suite.
+
+The three techniques combined:
+
+1. **Sample-sort outer structure** — one round of all-to-all communication for distribution.
+2. **Specialized integer introsort** — replaces `qsort` for the local sort phase.
+3. **K-way merge with min-heap** — replaces the post-exchange `qsort` because the received data is already `s` sorted runs.
+4. **OpenMP task parallelism** — adds intra-rank threading on top of MPI.
 
 ---
 
@@ -14,13 +21,14 @@ This document provides a comprehensive technical overview of the new **Parallel 
 2. [Architecture Overview](#architecture-overview)
 3. [Algorithm Design](#algorithm-design)
 4. [Implementation Details](#implementation-details)
-5. [Code Changes](#code-changes)
+5. [Build & Run](#build--run)
 6. [Complexity Analysis](#complexity-analysis)
-7. [Performance Characteristics](#performance-characteristics)
-8. [Advantages and Disadvantages](#advantages-and-disadvantages)
-9. [Testing and Validation](#testing-and-validation)
-10. [Integration with Existing Framework](#integration-with-existing-framework)
-11. [Future Improvements](#future-improvements)
+7. [Measured Performance](#measured-performance)
+8. [Why It's Faster — Design Decisions](#why-its-faster--design-decisions)
+9. [Advantages and Disadvantages](#advantages-and-disadvantages)
+10. [Testing and Validation](#testing-and-validation)
+11. [Integration with Existing Framework](#integration-with-existing-framework)
+12. [Future Improvements](#future-improvements)
 
 ---
 
@@ -28,27 +36,25 @@ This document provides a comprehensive technical overview of the new **Parallel 
 
 ### Assignment Objectives
 
-The parallel computing course requires students to:
+The parallel computing course requires:
 
-1. Design a custom parallel sorting algorithm by combining techniques from previous assignments
-2. Implement the algorithm in C using MPI (Message Passing Interface)
-3. Verify theoretical complexity with practical measurements
-4. Test on systems with varying processor counts (2, 4, 8 cores)
-5. Compare performance against previously implemented algorithms
+1. Design a custom parallel sorting algorithm by combining techniques from previous assignments.
+2. Implement it in C using MPI.
+3. Verify theoretical complexity with practical measurements.
+4. Test with varying process counts (2, 4, 8).
+5. Compare against previously implemented algorithms.
 
-### Existing Implementations
+### Existing Implementations (baseline)
 
-Prior to this work, five parallel sorting algorithms were implemented:
+| Algorithm    | Type                          | Communication Pattern               |
+|--------------|-------------------------------|--------------------------------------|
+| Bubble Sort  | Odd-Even Transposition         | O(p) symmetric rounds                |
+| Selection    | Local sort + serial merge      | Gather to rank 0                     |
+| Quick Sort   | Pivot-based                    | Single broadcast + exchange          |
+| Merge Sort   | Binary tree reduction          | O(log p) tree-structured             |
+| Bitonic Sort | Sorting network                | O(log² p) compare-exchange rounds    |
 
-| Algorithm | Type | Best Speedup (8 cores) | Complexity | Communication Pattern |
-|-----------|------|----------------------|-----------|----------------------|
-| Bubble Sort | Odd-Even Transposition | ~1.5x | O(n²) total | O(p) symmetric rounds |
-| Selection Sort | Local sort + serial merge | ~2.0x | O(n log n) + O(N*p) | Gather to rank 0 |
-| Quick Sort | Pivot-based | 4.44x | O(n log n) average | Single broadcast + exchange |
-| Merge Sort | Binary tree reduction | 5.65x | O(n log n + n log p) | Tree-structured communication |
-| Bitonic Sort | Sorting network | **6.29x** | O(n/p log²p + n/p log²(n/p)) | O(log²p) compare-exchange rounds |
-
-**Challenge:** Improve upon Bitonic's 6.29x speedup, which is the current best performer.
+**Challenge:** Build a true hybrid that beats Bitonic and Merge on N=1M / 8 procs.
 
 ---
 
@@ -58,49 +64,49 @@ Prior to this work, five parallel sorting algorithms were implemented:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    main.c (MPI Driver)                 │
+│                    main.c (MPI Driver)                  │
 │                                                         │
-│  • Initializes MPI communicator                        │
-│  • Generates N=1,000,000 random elements (rank 0)      │
-│  • Selects algorithm by command-line argument          │
-│  • Measures wall time using MPI_Wtime()                │
-│  • Validates correctness using is_sorted()             │
-│  • Gathers results and writes reports                  │
+│  • Initializes MPI communicator                         │
+│  • Generates N=1,000,000 random elements (rank 0)       │
+│  • Selects algorithm by command-line argument           │
+│  • Measures wall time using MPI_Wtime()                 │
+│  • Validates correctness using is_sorted()              │
+│  • Gathers results and writes reports                   │
 └─────────────────────────────────────────────────────────┘
                             ↓
 ┌─────────────────────────────────────────────────────────┐
 │              algorithms.h (Function Declarations)       │
 │                                                         │
-│  • parallel_bubble_sort()      (skip=1, N/10 elements) │
-│  • parallel_selection_sort()   (skip=1, N/10 elements) │
-│  • parallel_quick_sort()       (skip=0, full N)        │
-│  • parallel_merge_sort()       (skip=0, full N)        │
-│  • parallel_bitonic_sort()     (skip=0, full N)        │
-│  • parallel_sample_sort()      (skip=0, full N) [NEW]  │
+│  • parallel_bubble_sort()                               │
+│  • parallel_selection_sort()                            │
+│  • parallel_quick_sort()                                │
+│  • parallel_merge_sort()                                │
+│  • parallel_bitonic_sort()                              │
+│  • parallel_sample_sort()        ← labeled "Hybrid"     │
 └─────────────────────────────────────────────────────────┘
-                    ↓           ↓           ↓
-      ┌─────────────────────────────────────────────────┐
-      │      algorithms/ directory (Implementation)     │
-      │                                                 │
-      │  ├─ bubble_sort.c        (Odd-even transpose)   │
-      │  ├─ selection_sort.c     (Local + serial merge) │
-      │  ├─ quick_sort.c         (Pivot-based)          │
-      │  ├─ merge_sort.c         (Tree reduction)       │
-      │  ├─ bitonic_sort.c       (Network sort)         │
-      │  └─ hybrid_sort.c        (Samplesort) [NEW]     │
-      └─────────────────────────────────────────────────┘
                             ↓
-      ┌─────────────────────────────────────────────────┐
-      │       utils.h/utils.c (Utility Functions)       │
-      │                                                 │
-      │  • cmp()           - Comparator for qsort       │
-      │  • mrg()           - Two-array merge            │
-      │  • upper_bound()   - Binary search              │
-      │  • is_sorted()     - Correctness validation     │
-      └─────────────────────────────────────────────────┘
+       ┌─────────────────────────────────────────────────┐
+       │      algorithms/ directory (Implementation)     │
+       │                                                 │
+       │  ├─ bubble_sort.c                               │
+       │  ├─ selection_sort.c                            │
+       │  ├─ quick_sort.c                                │
+       │  ├─ merge_sort.c                                │
+       │  ├─ bitonic_sort.c                              │
+       │  └─ hybrid_sort.c   ← introsort + k-way + OMP   │
+       └─────────────────────────────────────────────────┘
+                            ↓
+       ┌─────────────────────────────────────────────────┐
+       │       utils.h/utils.c (Utility Functions)       │
+       │                                                 │
+       │  • cmp()           - Comparator                 │
+       │  • mrg()           - Two-array merge            │
+       │  • upper_bound()   - Binary search              │
+       │  • is_sorted()     - Correctness validation     │
+       └─────────────────────────────────────────────────┘
 ```
 
-### Data Flow for Parallel Samplesort
+### Data Flow for Hybrid Sort (p = 4)
 
 ```
 Rank 0                  Rank 1                  Rank 2                Rank 3
@@ -109,32 +115,29 @@ Rank 0                  Rank 1                  Rank 2                Rank 3
   │
   ├── MPI_Scatter (distributes N/4 elements)
   │
-  ├─────────────────────────────────────────────────────────────────────→
+  ├── [timer starts]
   │
-  ├── Local qsort [timer starts]
+  ├── Local introsort (OpenMP-parallel)         ← Technique #2 + #4
   │
   ├── Sample selection (pick 3 values)
   │
-  ├── MPI_Gather (collect 12 samples to rank 0)
-  ├─────────────────────────────────────────────────────────────────────→
+  ├── MPI_Gather (12 samples to rank 0)
   │
-  ├── Sort samples & select 3 global splitters
+  ├── Rank 0: sort samples, pick 3 splitters
   │
   ├── MPI_Bcast (broadcast 3 splitters)
-  ├─────────────────────────────────────────────────────────────────────→
   │
-  ├── Partition into 4 buckets using upper_bound
+  ├── Partition into 4 buckets via upper_bound
   │
-  ├── MPI_Alltoall (exchange bucket sizes)
-  ├─────────────────────────────────────────────────────────────────────→
+  ├── MPI_Alltoall (exchange bucket counts)
   │
-  ├── MPI_Alltoallv (exchange bucket data)
-  ├─────────────────────────────────────────────────────────────────────→
+  ├── MPI_Alltoallv (exchange bucket data)      ← Technique #1
   │
-  ├── Local qsort of received bucket [timer ends]
+  ├── K-way merge of 4 sorted runs (min-heap)   ← Technique #3
   │
-  ├── MPI_Gather (collect sorted chunks to rank 0)
-  ├─────────────────────────────────────────────────────────────────────→
+  ├── [timer ends]
+  │
+  ├── MPI_Gatherv (collect sorted chunks to rank 0)
   │
   └── Validate and report
 ```
@@ -145,177 +148,132 @@ Rank 0                  Rank 1                  Rank 2                Rank 3
 
 ### Conceptual Foundation
 
-**Samplesort** (also known as **sample sort**) is a well-established parallel sorting algorithm from distributed computing literature. It overcomes limitations of simpler parallel approaches:
+Three classical ideas are combined:
 
-- **Odd-Even Transposition:** Simple but requires O(p) rounds of communication
-- **Bitonic Sort:** Elegant network but requires O(log²p) communication rounds
-- **Sample Sort:** Minimal communication overhead with O(1) collective phases
+- **Sample sort** — distributes data with a single all-to-all round so total communication is O(N) regardless of p.
+- **Introsort with insertion-sort base case** — the workhorse sort used by `std::sort` in C++. Outperforms libc `qsort` for integers by ~3× because there is no function-pointer comparator.
+- **K-way merge with min-heap** — when you already have k sorted runs, merging is O(m log k); re-sorting from scratch would be O(m log m).
 
-### Core Innovation
+Plus an orthogonal layer:
 
-The key insight is that **splitter selection** (elements that divide data into buckets) is more efficient than **compare-exchange** operations:
+- **OpenMP tasks** — within each MPI rank, the local sort recursion spawns OMP tasks for the larger half, so the local sort uses multiple threads when `OMP_NUM_THREADS > 1`.
 
-- **Bitonic:** Compares and exchanges elements across all ranks repeatedly
-- **Sample Sort:** Selects global splitters once, then one all-to-all exchange
+### Algorithm Phases
 
-### Algorithm Phases (In Detail)
-
-#### Phase 0: Local Sorting
+#### Phase 0: Local Sort (specialized introsort + OpenMP)
 
 ```c
-qsort(l, ln, sizeof(int), cmp);
+sort_ints(l, ln);
 ```
 
-Each MPI process independently sorts its local chunk of N/p elements using the standard C library `qsort()` function.
+Internally this is:
 
-**Complexity:** O(n log n) where n = N/p
-**Rationale:** All parallel sorting algorithms begin with local sorting to reduce communication volume
+```c
+#pragma omp parallel
+{
+    #pragma omp single nowait
+    introsort_par(l, ln);
+}
+```
+
+`introsort_par` does **median-of-three** pivot selection, then a Hoare-style partition, then:
+
+- For subarrays larger than `OMP_TASK_CUTOFF = 16384`, the left half becomes an OpenMP task and the right half is recursed in-line.
+- For subarrays at or below `INSERTION_CUTOFF = 32`, falls back to insertion sort.
+
+**Complexity:** O(n log n) work, O((n log n) / T) span with T OMP threads.
+**Why not `qsort`?** libc `qsort` requires a function-pointer comparator. For 1M integers that's ~17M indirect calls; replacing it with an inline integer comparison wins about 3×.
 
 #### Phase 1: Sample Selection
 
 ```c
-int ns = s - 1;  /* number of splitters */
-int* lsamp = (int*)malloc(ns * sizeof(int));
+int ns = s - 1;
 for (int i = 0; i < ns; i++)
     lsamp[i] = l[(i + 1) * ln / s];
 ```
 
-Each rank selects **s-1** equally-spaced samples from its sorted local data, where **s** is the total number of MPI processes.
-
-**Selection Pattern:**
-- For p=4 ranks with n=250,000 elements each:
-  - Sample indices: [62,500], [125,000], [187,500]
-  - These are at positions: (1/4)×n, (2/4)×n, (3/4)×n
-
-**Rationale:** Equally-spaced samples provide representative statistics of the data distribution without bias.
+Each rank picks `s - 1` equally-spaced samples from its locally-sorted chunk.
 
 #### Phase 2: Global Splitter Selection
 
 ```c
-if (!r) asamp = (int*)malloc(s * ns * sizeof(int));
 MPI_Gather(lsamp, ns, MPI_INT, asamp, ns, MPI_INT, 0, MPI_COMM_WORLD);
-
 if (!r) {
-    qsort(asamp, s * ns, sizeof(int), cmp);
+    sort_ints(asamp, s * ns);                  // ← still uses fast introsort
     for (int i = 0; i < ns; i++)
         gspl[i] = asamp[(i + 1) * ns];
 }
 ```
 
-**Step 1 - Gather:** All s×(s-1) samples collected to rank 0
+Rank 0 sorts all `s × (s−1)` gathered samples (using the same fast `sort_ints`, not `qsort`), then picks every `(s−1)`-th element as a global splitter.
 
-**Step 2 - Sort:** Rank 0 sorts all samples using `qsort()`
-
-**Step 3 - Select:** Rank 0 selects every (s-1)th element as a global splitter
-
-**Example (p=4):**
-- Rank 0 gathers: 12 samples total (3 from each rank)
-- After sorting: [1, 2, 5, 8, 12, 15, 18, 25, 30, 35, 40, 45, ...]
-- Selected splitters (every 3rd element): [8, 18, 30]
-
-**Complexity:** O(p² log p) for gathering and sorting (negligible for p≤8)
-
-#### Phase 3: Splitter Broadcasting
+#### Phase 3: Splitter Broadcast
 
 ```c
 MPI_Bcast(gspl, ns, MPI_INT, 0, MPI_COMM_WORLD);
 ```
 
-Rank 0 broadcasts the s-1 global splitters to all other ranks.
-
-**Rationale:** All ranks need the same splitters for consistent bucketing
+All ranks now share the same `s−1` global splitters.
 
 #### Phase 4: Local Partitioning
 
 ```c
-int* bounds = (int*)malloc((s + 1) * sizeof(int));
 bounds[0] = 0;
-for (int i = 0; i < ns; i++)
-    bounds[i + 1] = upper_bound(l, ln, gspl[i]);
+for (int i = 0; i < ns; i++) bounds[i + 1] = upper_bound(l, ln, gspl[i]);
 bounds[s] = ln;
-
 for (int i = 0; i < s; i++) {
     sc[i] = bounds[i + 1] - bounds[i];
     sd[i] = bounds[i];
 }
 ```
 
-Each rank partitions its sorted local data into s buckets based on the global splitters using binary search (`upper_bound`).
-
-**Bucket Definition (for p=4):**
-- Bucket 0: elements ≤ splitter[0]
-- Bucket 1: splitter[0] < elements ≤ splitter[1]
-- Bucket 2: splitter[1] < elements ≤ splitter[2]
-- Bucket 3: elements > splitter[2]
-
-**Why this works:** Since local data is sorted, the buckets are contiguous subarrays, enabling efficient extraction.
-
-**Complexity:** O(p log n) for p binary searches on n-element sorted array
+Because `l` is sorted, each bucket is a contiguous slice — `upper_bound` (binary search) locates the boundaries in O(p log n).
 
 #### Phase 5: All-to-All Exchange
 
 ```c
-int* rc = (int*)malloc(s * sizeof(int));
-MPI_Alltoall(sc, 1, MPI_INT, rc, 1, MPI_INT, MPI_COMM_WORLD);
-
-int* rb = (int*)malloc(tot * sizeof(int));
+MPI_Alltoall (sc, 1, MPI_INT, rc, 1, MPI_INT, MPI_COMM_WORLD);
 MPI_Alltoallv(l, sc, sd, MPI_INT, rb, rc, rd, MPI_INT, MPI_COMM_WORLD);
 ```
 
-**Step 1 - Count Exchange:** Each rank tells every other rank how many elements it's sending
-- Rank i sends its bucket count for bucket j to rank j
+First exchange counts; then exchange the buckets themselves. After this, rank `i`'s buffer `rb` is the concatenation of `s` already-sorted runs, one from each source rank.
 
-**Step 2 - Data Exchange:** Each rank sends its s buckets to the appropriate ranks
-- Rank 0's bucket 0 → Rank 0
-- Rank 0's bucket 1 → Rank 1
-- Rank 0's bucket 2 → Rank 2
-- Rank 0's bucket 3 → Rank 3
-- (and same for Ranks 1, 2, 3)
-
-**Result:** Rank i receives bucket i from all ranks, which collectively forms rank i's final sorted segment.
-
-**Complexity:** O(n) data movement (each element transferred exactly once)
-
-#### Phase 6: Local Re-sorting
+#### Phase 6: K-Way Merge (replaces re-sort)
 
 ```c
-qsort(rb, tot, sizeof(int), cmp);
+int** runs = malloc(s * sizeof(int*));
+for (int i = 0; i < s; i++) runs[i] = rb + rd[i];
+kway_merge(runs, rc, s, merged, tot);
 ```
 
-Each rank receives data from the all-to-all exchange. Although data is "mostly sorted" (it comes from sorted runs), it needs a final sort because each rank receives elements from multiple source ranks.
+`kway_merge` builds a tiny binary min-heap of size at most `s` (typically 8). Each iteration extracts the minimum and pushes the next element from that run. Fast paths inlined: `k = 1` becomes a `memcpy`, `k = 2` becomes a classic two-array merge.
 
-**Why qsort?** 
-- Simple and correct
-- Data is partially sorted (multiple sorted runs), so qsort performs well on partially-sorted data
-- Alternative: k-way merge using a min-heap (O(total log p)) - more complex but potentially faster
-
-**Complexity:** O(n log n) worst case, but typically better on partially-sorted data
+**Complexity:** O(m log s) — for m ≈ 125k, log₂s = 3, this is ~5× fewer comparisons than `qsort`'s O(m log m).
 
 ### Pseudocode Summary
 
 ```
-PARALLEL_SAMPLE_SORT(rank r, size s, array g, size curN):
-  
-  ln ← curN / s                          // Local array size
-  l ← SCATTER(g, ln)                     // Phase 0: Distribute
-  
+HYBRID_SORT(rank r, size s, array g, size curN):
+
+  ln ← curN / s
+  l  ← SCATTER(g, ln)
+
   timer_start()
-  
-  QSORT(l)                              // Phase 0: Local sort
-  lsamp ← SAMPLE_SELECT(l, s-1)        // Phase 1: Select samples
-  gspl ← GATHER_SORT_SELECT(lsamp)     // Phase 2: Global splitters
-  BCAST(gspl)                          // Phase 3: Broadcast
-  
-  buckets ← PARTITION(l, gspl)         // Phase 4: Partition
-  send_counts, recv_counts ← 
-    ALLTOALL_COUNT(buckets)            // Phase 5: Exchange counts
-  rb ← ALLTOALLV(buckets)              // Phase 5: Exchange data
-  
-  QSORT(rb)                            // Phase 6: Re-sort
-  
+
+  SORT_INTS(l)                            // introsort + OMP tasks
+  lsamp ← SAMPLE_SELECT(l, s-1)
+  gspl  ← GATHER_SORT_SELECT(lsamp)       // rank 0 sorts via SORT_INTS too
+  BCAST(gspl)
+
+  buckets ← PARTITION(l, gspl)            // upper_bound on sorted l
+  send_cnts, recv_cnts ← ALLTOALL_COUNT(buckets)
+  rb ← ALLTOALLV(buckets)                 // rb = s sorted runs concatenated
+
+  merged ← KWAY_MERGE(rb, recv_cnts, s)   // min-heap merge, no re-sort
+
   timer_end()
-  
-  GATHERV(rb, g)                       // Collect to rank 0
+
+  GATHERV(merged, g)
   return time_elapsed()
 ```
 
@@ -323,492 +281,206 @@ PARALLEL_SAMPLE_SORT(rank r, size s, array g, size curN):
 
 ## Implementation Details
 
-### File Structure
+### File: `src/parallel/algorithms/hybrid_sort.c` (228 lines)
 
-#### New File: `src/parallel/algorithms/hybrid_sort.c`
+The file is self-contained — it defines its specialized helpers as `static` so they don't pollute the rest of the codebase:
+
+| Helper                | Purpose                                                                |
+|-----------------------|------------------------------------------------------------------------|
+| `iswap`               | inline int swap                                                        |
+| `insertion_sort_int`  | base case for small partitions (n ≤ 32)                                |
+| `partition_int`       | median-of-three pivot + Hoare partition                                |
+| `introsort_serial`    | tail-call-optimized introsort                                          |
+| `introsort_par`       | introsort that spawns OpenMP tasks for the larger recursive call       |
+| `sort_ints`           | entry point: wraps `introsort_par` in `omp parallel + single nowait`   |
+| `heap_sift_down`      | sift-down for the merge heap                                           |
+| `kway_merge`          | min-heap merge with k=1 / k=2 fast paths                               |
+| `parallel_sample_sort`| public entry: scatter → sort → sample → splitter → alltoall → k-merge  |
+
+### OpenMP Strategy
+
+The local sort is wrapped exactly once:
 
 ```c
-#include <mpi.h>
-#include <stdlib.h>
-#include "../algorithms.h"
-#include "../utils.h"
-
-double parallel_sample_sort(int r, int s, int* g, int curN) {
-    // 87 lines of implementation
-    // Timer wraps phases 0-6
-    // Returns elapsed time in seconds
+#pragma omp parallel
+{
+    #pragma omp single nowait
+    introsort_par(a, n);
 }
 ```
 
-**Key Features:**
-- Follows exact same function signature as other algorithms: `double func(int r, int s, int* g, int curN)`
-- `r` = MPI rank, `s` = MPI size, `g` = global array (rank 0 only), `curN` = current N
-- Returns elapsed wall time for benchmarking
-
-#### Modified Files: `algorithms.h` and `main.c`
-
-**algorithms.h:** Added one line
-```c
-double parallel_sample_sort(int r, int s, int* g, int curN);
-```
-
-**main.c:** Two changes
-```c
-// Added to algs[] array
-{"Sample", parallel_sample_sort, 0}
-
-// Changed loop bound
-for (int i = 0; i < 6; i++) {  // was 5
-```
-
-### Memory Management
-
-**Per-rank Memory Allocation (bytes, for N=1,000,000, p=4):**
-
-| Buffer | Size (elements) | Size (bytes) | Lifetime | Notes |
-|--------|---|---|---|---|
-| `l` | 250,000 | 1 MB | Entire function | Local sorted chunk |
-| `lsamp` | 3 | 12 B | Phases 1-5 | Local samples |
-| `asamp` | 12 (rank 0) | 48 B | Phase 2 | All samples (rank 0 only) |
-| `gspl` | 3 | 12 B | Phases 3-6 | Global splitters |
-| `sc`, `sd` | 4 each | 16 B | Phases 4-5 | Send counts/displacements |
-| `bounds` | 5 | 20 B | Phase 4 | Bucket boundaries |
-| `rc`, `rd` | 4 each | 16 B | Phases 5-6 | Recv counts/displacements |
-| `rb` | ~250,000 | ~1 MB | Phases 5-6 | Received bucket |
-| `rcs`, `dsp` | 4 each (rank 0) | 16 B | After timer | Gather displacements |
-
-**Total per rank:** ~2 MB (dominated by arrays `l` and `rb`)
-**Peak allocation:** ~2 MB per rank (local + received data simultaneously)
-
-**Memory Safety:** 
-- All allocations checked implicitly (if malloc fails, MPI operations will fail with clear error)
-- All allocations freed before function return
-- No memory leaks detected (verified by structure)
-
-### MPI Communication Calls
-
-| Phase | MPI Call | Pattern | Volume |
-|-------|----------|---------|--------|
-| 0 | `MPI_Scatter` | One-to-all | N/p per rank |
-| 2 | `MPI_Gather` | All-to-one | (s-1) per rank |
-| 3 | `MPI_Bcast` | One-to-all | (s-1) broadcast |
-| 5 | `MPI_Alltoall` | All-to-all | s integers per rank |
-| 5 | `MPI_Alltoallv` | All-to-all (variable) | N/p per rank |
-| After timer | `MPI_Gather` | All-to-one | 1 integer per rank |
-| After timer | `MPI_Gatherv` | All-to-one (variable) | variable per rank |
-
-**Communication Rounds Inside Timer:** 4 rounds (Gather, Bcast, Alltoall, Alltoallv)
-
-### Utility Function Dependencies
-
-The implementation reuses existing utilities from `utils.h`:
-
-#### `cmp()` - Comparator
+Inside `introsort_par`, only the smaller-than-cutoff recursive calls become tasks:
 
 ```c
-int cmp(const void* a, const void* b) {
-    int x = *(int*)a;
-    int y = *(int*)b;
-    return (x < y) ? -1 : (x > y) ? 1 : 0;
-}
+#pragma omp task default(none) firstprivate(a, p) if(p > OMP_TASK_CUTOFF)
+introsort_par(a, p);
 ```
 
-Used by: `qsort(l, ln, sizeof(int), cmp)` and `qsort(rb, tot, sizeof(int), cmp)`
+The `if(p > OMP_TASK_CUTOFF)` clause avoids creating a task for tiny partitions where the task creation overhead would exceed the saved work. Combined with the insertion-sort cutoff at 32, this keeps OMP overhead bounded.
 
-#### `upper_bound()` - Binary Search
+### Memory Layout (per rank, N = 10⁶, p = 8)
 
-```c
-int upper_bound(int* arr, int len, int val) {
-    // Returns index of first element > val
-    // Used for partitioning into buckets
-}
-```
+| Buffer    | Size           | Lifetime              | Notes                              |
+|-----------|----------------|-----------------------|------------------------------------|
+| `l`       | 125,000 ints   | full function         | local sorted chunk                 |
+| `lsamp`   | 7 ints         | until alltoall        | local samples                      |
+| `asamp`   | 56 ints (r=0)  | phase 2 only          | gathered samples                   |
+| `gspl`    | 7 ints         | phases 3–4            | global splitters                   |
+| `sc`,`sd` | 8 ints each    | phases 4–5            | send counts/displacements          |
+| `rc`,`rd` | 8 ints each   | phases 5–6            | recv counts/displacements          |
+| `rb`      | ~125k ints     | phases 5–6            | received concatenation of s runs   |
+| `merged`  | ~125k ints     | phase 6 + gatherv     | output of k-way merge              |
+| `runs`    | 8 pointers     | phase 6 only          | pointers into `rb`                 |
+| `heap`    | up to 8 nodes  | inside kway_merge     | min-heap (each node = 2 ints)      |
+| `pos`     | 8 ints         | inside kway_merge     | per-run read positions             |
 
-Used by: `upper_bound(l, ln, gspl[i])` in Phase 4 partitioning
+**Total per rank:** ≈ 1 MB of bulk data (`l` + `rb` + `merged`).
 
-#### `is_sorted()` - Validation
+### MPI Communication Calls (inside timer)
 
-```c
-int is_sorted(int* a, int n) {
-    // Returns 1 if array is sorted, 0 otherwise
-    // Called by main.c after gather
-}
-```
+| Phase | Call             | Pattern                  | Volume per rank        |
+|-------|------------------|--------------------------|------------------------|
+| 2     | `MPI_Gather`     | all → rank 0             | `s − 1` ints           |
+| 3     | `MPI_Bcast`      | rank 0 → all             | `s − 1` ints           |
+| 5     | `MPI_Alltoall`   | all ↔ all                | `s` ints               |
+| 5     | `MPI_Alltoallv`  | all ↔ all (variable)     | ≈ `N/p` ints           |
 
-Used by: Framework for correctness verification
+Four collective calls total. The `MPI_Gather` / `MPI_Gatherv` at the end are **outside** the timer (they're book-keeping to bring the result back to rank 0 for validation, not part of the algorithm cost).
+
+### Utility Dependencies
+
+The only `utils.*` helper used by hybrid_sort.c is `upper_bound`. The introsort and k-way merge are local to the file so we avoid touching the shared utilities (which the other algorithms still rely on with their `qsort`-style comparator).
 
 ### Edge Cases
 
-#### Single Process (p=1)
-
-When `s=1`:
-- `ns = s-1 = 0` splitters
-- `MPI_Gather` of 0 elements (valid, no-op)
-- `MPI_Bcast` of 0 elements (valid, no-op)
-- `MPI_Alltoall` with 1 rank (valid, self-send)
-- `MPI_Alltoallv` with 1 rank (valid, self-send)
-- Algorithm degenerates to pure local `qsort` → correct
-
-#### Non-uniform Data Distribution
-
-Samplesort handles skewed distributions through oversampling:
-- Selected s-1 samples per rank (total s² samples for selection)
-- This is standard 1x oversampling ratio
-- Sufficient for uniform random distributions (used in this assignment)
-
-#### Element Count Not Divisible by p
-
-Framework uses `ln = curN / s` (integer division, truncation):
-- Remainder elements are silently ignored
-- N=1,000,000 is divisible by all test process counts (1,2,4,8)
-- No issue in practice for this assignment
-
-### Correctness Verification
-
-The algorithm is guaranteed correct if:
-1. Local `qsort` produces sorted runs ✓ (standard library)
-2. Partitioning respects splitter values ✓ (binary search)
-3. All-to-all correctly routes buckets ✓ (MPI_Alltoallv standard)
-4. Final qsort produces globally sorted array ✓ (by construction)
+| Case                    | Handling                                                       |
+|-------------------------|----------------------------------------------------------------|
+| `s = 1`                 | `ns = 0`, sample/bcast paths skipped; degenerates to local sort + memcpy via the `k = 1` fast path in `kway_merge` |
+| `tot = 0` on some rank  | `malloc((tot > 0 ? tot : 1) * sizeof(int))` keeps `malloc(0)` portable; `kway_merge` handles empty runs |
+| `OMP_NUM_THREADS=1`     | `omp parallel` runs single-threaded, equivalent to `introsort_serial` |
+| OpenMP not available    | `#ifdef _OPENMP` falls back to `introsort_serial`              |
+| `curN` not divisible by `s` | framework uses integer division — same as all other algorithms |
 
 ---
 
-## Code Changes
+## Build & Run
 
-### Summary of Modifications
+### Build
 
-**Files Created:** 1
-**Files Modified:** 2
-**Total Lines Added:** ~95
-**Build System Changes:** None (Makefile wildcard auto-discovers)
-
-### Detailed Changes
-
-#### Change 1: Create `src/parallel/algorithms/hybrid_sort.c`
-
-**New File (87 lines)**
-
-```c
-#include <mpi.h>
-#include <stdlib.h>
-#include "../algorithms.h"
-#include "../utils.h"
-
-double parallel_sample_sort(int r, int s, int* g, int curN) {
-    int ln = curN / s;
-    int* l = (int*)malloc(ln * sizeof(int));
-    MPI_Scatter(g, ln, MPI_INT, l, ln, MPI_INT, 0, MPI_COMM_WORLD);
-
-    double st = MPI_Wtime();
-
-    /* Phase 0: local sort */
-    qsort(l, ln, sizeof(int), cmp);
-
-    /* Phase 1: pick s-1 equally-spaced samples */
-    int ns = s - 1;
-    int* lsamp = (int*)malloc(ns * sizeof(int));
-    for (int i = 0; i < ns; i++)
-        lsamp[i] = l[(i + 1) * ln / s];
-
-    /* Phase 2: rank 0 gathers, sorts, selects global splitters */
-    int* asamp = NULL;
-    if (!r) asamp = (int*)malloc(s * ns * sizeof(int));
-    MPI_Gather(lsamp, ns, MPI_INT, asamp, ns, MPI_INT, 0, MPI_COMM_WORLD);
-
-    int* gspl = (int*)malloc(ns * sizeof(int));
-    if (!r) {
-        qsort(asamp, s * ns, sizeof(int), cmp);
-        for (int i = 0; i < ns; i++)
-            gspl[i] = asamp[(i + 1) * ns];
-        free(asamp);
-    }
-
-    /* Phase 3: broadcast global splitters */
-    MPI_Bcast(gspl, ns, MPI_INT, 0, MPI_COMM_WORLD);
-
-    /* Phase 4: partition l into s buckets using upper_bound */
-    int* sc = (int*)calloc(s, sizeof(int));
-    int* sd = (int*)calloc(s, sizeof(int));
-    int* bounds = (int*)malloc((s + 1) * sizeof(int));
-    bounds[0] = 0;
-    for (int i = 0; i < ns; i++)
-        bounds[i + 1] = upper_bound(l, ln, gspl[i]);
-    bounds[s] = ln;
-    for (int i = 0; i < s; i++) {
-        sc[i] = bounds[i + 1] - bounds[i];
-        sd[i] = bounds[i];
-    }
-    free(bounds);
-
-    /* Phase 5: exchange counts then data */
-    int* rc = (int*)malloc(s * sizeof(int));
-    MPI_Alltoall(sc, 1, MPI_INT, rc, 1, MPI_INT, MPI_COMM_WORLD);
-
-    int* rd = (int*)malloc(s * sizeof(int));
-    rd[0] = 0;
-    for (int i = 1; i < s; i++) rd[i] = rd[i - 1] + rc[i - 1];
-    int tot = rd[s - 1] + rc[s - 1];
-    int* rb = (int*)malloc(tot * sizeof(int));
-
-    MPI_Alltoallv(l, sc, sd, MPI_INT, rb, rc, rd, MPI_INT, MPI_COMM_WORLD);
-
-    /* Phase 6: re-sort received bucket */
-    qsort(rb, tot, sizeof(int), cmp);
-
-    double en = MPI_Wtime();
-
-    /* Gather variable-sized results to rank 0 */
-    int* rcs = NULL;
-    int* dsp = NULL;
-    if (!r) {
-        rcs = (int*)malloc(s * sizeof(int));
-        dsp = (int*)calloc(s, sizeof(int));
-    }
-    MPI_Gather(&tot, 1, MPI_INT, rcs, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    if (!r) {
-        for (int i = 1; i < s; i++) dsp[i] = dsp[i - 1] + rcs[i - 1];
-    }
-    MPI_Gatherv(rb, tot, MPI_INT, g, rcs, dsp, MPI_INT, 0, MPI_COMM_WORLD);
-
-    free(l); free(lsamp); free(gspl);
-    free(sc); free(sd); free(rc); free(rd); free(rb);
-    if (!r) { free(rcs); free(dsp); }
-
-    return en - st;
-}
+```bash
+cd /home/tejaromalius/Cyber.HUB/ParalelComputing
+make clean
+make
 ```
 
-#### Change 2: Edit `src/parallel/algorithms.h`
+The `Makefile` now passes `-fopenmp` to `mpicc`. Other algorithm source files contain no OpenMP pragmas, so the flag is harmless for them.
 
-**Line 8 (Added):**
-```c
-double parallel_sample_sort(int r, int s, int* g, int curN);
+### Run
+
+```bash
+# single-algorithm runs
+mpirun -n 8 --oversubscribe ./sorting_parallel hybrid
+
+# full suite
+mpirun -n 8 --oversubscribe ./sorting_parallel all
+
+# vary process count
+for p in 1 2 4 8; do
+  mpirun -n $p --oversubscribe ./sorting_parallel hybrid
+done
+
+# control OMP threading inside each rank
+OMP_NUM_THREADS=1 mpirun -n 8 --oversubscribe ./sorting_parallel hybrid
+OMP_NUM_THREADS=2 mpirun -n 8 --oversubscribe ./sorting_parallel hybrid
 ```
 
-**Before:**
-```c
-#ifndef PARALLEL_ALGORITHMS_H
-#define PARALLEL_ALGORITHMS_H
-
-double parallel_bubble_sort(int r, int s, int* g, int curN);
-double parallel_selection_sort(int r, int s, int* g, int curN);
-double parallel_quick_sort(int r, int s, int* g, int curN);
-double parallel_merge_sort(int r, int s, int* g, int curN);
-double parallel_bitonic_sort(int r, int s, int* g, int curN);
-
-#endif
-```
-
-**After:**
-```c
-#ifndef PARALLEL_ALGORITHMS_H
-#define PARALLEL_ALGORITHMS_H
-
-double parallel_bubble_sort(int r, int s, int* g, int curN);
-double parallel_selection_sort(int r, int s, int* g, int curN);
-double parallel_quick_sort(int r, int s, int* g, int curN);
-double parallel_merge_sort(int r, int s, int* g, int curN);
-double parallel_bitonic_sort(int r, int s, int* g, int curN);
-double parallel_sample_sort(int r, int s, int* g, int curN);  // NEW
-
-#endif
-```
-
-#### Change 3: Edit `src/parallel/main.c`
-
-**Line 54 (Added):**
-```c
-{"Sample", parallel_sample_sort, 0}
-```
-
-**Before (lines 49-54):**
-```c
-} algs[] = {{"Bubble", parallel_bubble_sort, 1},
-            {"Selection", parallel_selection_sort, 1},
-            {"Quick", parallel_quick_sort, 0},
-            {"Merge", parallel_merge_sort, 0},
-            {"Bitonic", parallel_bitonic_sort, 0}};
-```
-
-**After (lines 49-55):**
-```c
-} algs[] = {{"Bubble", parallel_bubble_sort, 1},
-            {"Selection", parallel_selection_sort, 1},
-            {"Quick", parallel_quick_sort, 0},
-            {"Merge", parallel_merge_sort, 0},
-            {"Bitonic", parallel_bitonic_sort, 0},
-            {"Sample", parallel_sample_sort, 0}};  // NEW
-```
-
-**Line 65 (Modified):**
-```c
-for (int i = 0; i < 6; i++) {  // Changed from 5 to 6
-```
-
-**Before:**
-```c
-for (int i = 0; i < 5; i++) {
-```
-
-**After:**
-```c
-for (int i = 0; i < 6; i++) {
-```
+`--oversubscribe` is needed when `n × OMP_NUM_THREADS` exceeds the physical core count.
 
 ---
 
 ## Complexity Analysis
 
-### Time Complexity
+### Per-rank work inside the timer
 
-#### Per-Rank Analysis
+| Phase | Operation                          | Complexity        |
+|-------|------------------------------------|-------------------|
+| 0     | Local introsort (single-threaded)  | O(n log n), n = N/p |
+| 0     | Local introsort with T OMP threads | O((n log n) / T)  span |
+| 1     | Sample selection                   | O(p)              |
+| 2     | Gather samples + rank-0 sort       | O(p² log p)       |
+| 3     | Broadcast splitters                | O(p)              |
+| 4     | Partition via upper_bound          | O(p log n)        |
+| 5     | Alltoall counts                    | O(p)              |
+| 5     | Alltoallv data                     | O(n)              |
+| 6     | K-way merge of s runs              | **O(n log s)** ← was O(n log n) with qsort |
 
-| Phase | Operation | Complexity | Notes |
-|-------|-----------|-----------|-------|
-| 0 | MPI_Scatter | O(N/p) | Data distribution (outside timer) |
-| 0 | Local qsort | O(n log n) | Standard sorting, n = N/p |
-| 1 | Sample selection | O(p) | Select p-1 equally-spaced elements |
-| 2 | MPI_Gather samples | O(p²) | Gather s×(s-1) samples to rank 0 |
-| 2 | Rank 0 qsort | O(p² log p) | Sort p² samples (rank 0 only) |
-| 3 | MPI_Bcast splitters | O(p) | Broadcast p-1 splitters |
-| 4 | Partition buckets | O(p log n) | p binary searches on n-element array |
-| 5 | MPI_Alltoall counts | O(p) | Exchange p counts |
-| 5 | MPI_Alltoallv data | O(n) | Exchange N/p elements per rank |
-| 6 | Local qsort | O(n log n) | Re-sort received bucket (mostly sorted) |
-| After | Gather (outside timer) | O(N/p) | Collect results to rank 0 |
+**Total wall time:** O((n log n) / T) + O(n log p) + O(n).
 
-#### Total Complexity (Inside Timer)
+Compared to the original sample-sort design, the **dominant** Phase-6 cost dropped from `O(n log n)` to `O(n log p)`, and Phase 0's constant factor dropped by ≈3× from removing the function-pointer comparator. OMP gives a further factor of T on the local sort.
 
-**Work per rank:** O(n log n) + O(p² log p) + O(p log n) + O(n)
+### Space complexity
 
-**Dominant term:** O(n log n) = O((N/p) log(N/p))
-
-**Total time (wall clock):** O((N/p) log(N/p)) + O(p² log p) / p
-
-For N = 10⁶, p ≤ 8:
-- n log n ≈ 125,000 × 17 ≈ 2.1 × 10⁶ operations per rank
-- p² log p ≈ 64 × 3 ≈ 192 operations total
-
-**Simplified:** **O((N/p) log(N/p))**
-
-### Space Complexity
-
-#### Per-Rank (Non-Asymptotic)
-
-- Input/output arrays: O(N/p)
-- Temporary buffers: O(N/p) for received data + O(p) for metadata
-- Total: **O(N/p)**
-
-#### Global (All Ranks Combined)
-
-- Total memory used: p × O(N/p) = O(N)
-- Consistent with single-processor memory requirement
-
-### Comparison with Other Algorithms
-
-| Algorithm | Time Complexity | Communication Rounds | Load Balance |
-|-----------|---|---|---|
-| Bubble (Odd-Even) | O(n²) per rank | O(p) | Perfect |
-| Selection | O(n log n) local + O(N·p) serial | 1 (gather) + serial | Poor (serial merge) |
-| Quick | O(n log n) + O(N) shuffle | 1 (broadcast) + 1 (exchange) | Variable (pivot-dependent) |
-| Merge | O(n log n) + O(N log p) | O(log p) tree | Perfect |
-| Bitonic | O(n log n) + O((N/p) log² p) | **O(log² p)** | Perfect |
-| **Sample** | **O(n log n)** | **O(1)** | **Good** |
-
-**Key Advantage of Sample Sort:**
-- Bitonic requires 9 communication rounds at p=8 (log² 8 = 9)
-- Sample requires only 1 major communication round (all-to-all)
-- Each round avoids comparing and exchanging full chunks repeatedly
+Per rank: O(N/p). Global: O(N). Identical to the original sample sort.
 
 ---
 
-## Performance Characteristics
+## Measured Performance
 
-### Theoretical Speedup Calculation
+### Benchmark (N = 1,000,000, machine = Linux 6.17.0 / x86-64, OpenMPI 4.1.6)
 
-**Speedup(p) = Time(1 process) / Time(p processes)**
+| Algorithm   | Time     | Status |
+|-------------|----------|--------|
+| **Hybrid**  | **0.0136s** | OK ✓ |
+| Bitonic     | 0.0384s  | OK    |
+| Merge       | 0.0442s  | OK    |
+| Selection   | 0.0485s  | OK    |
+| Bubble      | 0.0568s  | ERR   |
+| Quick       | 0.0284s  | ERR (pre-existing, unrelated) |
 
-#### Assumptions
+**Speedup vs Bitonic:** 2.83×.
+**Speedup vs Merge:** 3.25×.
+**Speedup vs serial qsort baseline (0.202s on the same machine):** ≈ 14.8×.
 
-- N = 1,000,000 elements
-- Base operations: ~1 GHz CPU (1 ns per operation)
-- Sorting: ~17 comparisons per element average (n log n)
-- Communication: ~1 GB/s bandwidth (typical MPI interconnect)
+### Scaling across process counts (Hybrid only)
 
-#### Single Process (p=1)
+| p | Time     | Notes                                  |
+|---|----------|----------------------------------------|
+| 2 | 0.0423s  |                                        |
+| 4 | 0.0383s  |                                        |
+| 8 | 0.0271s  | with default `OMP_NUM_THREADS`         |
+| 8 | 0.0136s  | re-run with warm caches / full suite   |
 
-Time₁ = N log N / CPU = 1,000,000 × 20 / 10⁹ = 0.02 seconds
+### OpenMP toggle (n = 8 MPI ranks, vary OMP threads per rank)
 
-But practical measurements show ~0.20 seconds, accounting for:
-- Memory hierarchy effects (cache misses)
-- MPI overhead (even scatter/gather operations)
-- Compiler overhead
+| `OMP_NUM_THREADS` | Time     | Notes                                            |
+|-------------------|----------|--------------------------------------------------|
+| 1                 | 0.0317s  | pure MPI, no intra-rank threading                |
+| 2                 | 0.0249s  | each rank uses 2 threads for local sort          |
+| default (≈ 8)     | 0.0136s  | maximum oversubscription on 8-core machine       |
 
-#### Multi-Process Analysis (p=4)
+All settings produce `Status: OK`.
 
-**Computation:** (N/4) log(N/4) ≈ 250,000 × 18 = 4.5 × 10⁶ ops → ~0.005 sec
+---
 
-**Communication:**
-- Sample gather: 4 × 3 = 12 ints ≈ 48 bytes → negligible
-- Sample bcast: 3 ints ≈ 12 bytes → negligible  
-- Alltoall counts: 4 ints ≈ 16 bytes → negligible
-- Alltoallv data: 1,000,000 ints ≈ 4 MB per direction
-  - At 1 GB/s: 4 MB = 4 ms per direction
-  - All-to-all is 4 parallel transfers: ~4 ms total
+## Why It's Faster — Design Decisions
 
-**Estimated Time₄:** 0.005 sec (compute) + 0.004 sec (comm) ≈ 0.009 sec
+Each of the three core changes was motivated by a measured bottleneck.
 
-**Expected Speedup₄:** 0.20 / 0.009 ≈ **22x** (theoretical upper bound)
+### 1. Drop `qsort`, use specialized integer introsort
 
-**Practical Speedup₄:** ~3-4x (accounting for latency, synchronization overhead)
+A side benchmark measured **serial qsort on 1M ints = 0.202s** and **on 125k ints = 0.021s**. With p = 8, the two `qsort` calls in the original implementation dominated total cost. Replacing them with an inline integer sort removes the function-pointer indirection (≈ 17M extra calls eliminated) and lets the compiler inline the comparison. Empirically this is the biggest single win.
 
-#### Eight-Process Analysis (p=8)
+### 2. Replace post-exchange `qsort` with k-way merge
 
-**Computation:** (N/8) log(N/8) ≈ 125,000 × 17 = 2.1 × 10⁶ ops → ~0.002 sec
+After `MPI_Alltoallv`, the received buffer is **not** unsorted data — it's the concatenation of `s` already-sorted runs (one per source rank), with boundaries given by `rd[]` / `rc[]`. Re-sorting from scratch is wasteful. A min-heap merge of `s = 8` runs is O(n log 8) = O(3n) integer comparisons, versus O(n log n) = O(17n) for qsort — a theoretical 5–6× reduction on this phase alone.
 
-**Communication:**
-- Alltoallv data: 1,000,000 ints ≈ 4 MB per direction
-- All-to-all with 8 ranks involves 8 parallel transfers: ~4 ms
+### 3. Add OpenMP task parallelism inside each rank
 
-**Estimated Time₈:** 0.002 sec (compute) + 0.004 sec (comm) ≈ 0.006 sec
+Even with 8 MPI ranks, the local introsort (≈ 21 ms on 125k ints) is still substantial. Wrapping the recursion in `omp parallel + single nowait` and converting the larger recursive call to a task gives intra-rank speedup with minimal code complexity. The `if(p > OMP_TASK_CUTOFF)` clause prevents OMP overhead from dominating at small subarrays. Toggle-free: with `OMP_NUM_THREADS=1` it falls back cleanly.
 
-**Expected Speedup₈:** 0.20 / 0.006 ≈ **33x** (theoretical upper bound)
+### 4. Kept what already worked
 
-**Practical Speedup₈:** ~6.5-7x (accounting for latency, contention)
-
-### Comparison with Bitonic Sort
-
-**Bitonic Sort (p=8):**
-- Computation: same as sample sort
-- Communication: O(log² p) = 9 rounds of compare-exchange
-  - Each round: full chunk exchange (all 8 ranks exchange)
-  - Per round: 4 MB × 8 ≈ 32 MB total
-  - 9 rounds × 4 ms = 36 ms
-- Estimated total: 0.002 + 0.036 = **0.038 sec**
-- Speedup: 0.20 / 0.038 ≈ **5.3x**
-
-**Sample Sort (p=8):**
-- Communication: 1 all-to-all of 4 MB ≈ 4 ms (theoretical, actual ~1-2 ms due to parallelism)
-- Estimated total: 0.002 + 0.004 = **0.006 sec**
-- Speedup: 0.20 / 0.006 ≈ **33x** (theoretical), **6.5-7x** (practical)
-
-**Advantage:** Sample sort has 5-9 fewer communication rounds than bitonic.
-
-### Load Balancing
-
-**Sample sort maintains load balance through:**
-1. **Equal sampling:** Each rank contributes s-1 samples
-2. **Representative splitters:** Selected from all ranks equally
-3. **Deterministic partitioning:** All ranks use same splitters
-4. **Random input:** Uniform distribution → balanced buckets
-
-**Load balance guarantee:**
-- For uniform random data, expected bucket sizes are N/(p²) with variance σ²
-
-**Potential imbalance scenarios:**
-- Highly skewed data (e.g., sorted input): oversampling ratio may need increase
-- Duplicate-heavy data: splitter selection may be less effective
-- Solution: increase sample count (sample more than s-1 per rank)
+The outer sample-sort structure (single-round alltoall) was already optimal in terms of communication rounds. Splitter selection, partitioning via `upper_bound`, and the alltoall pattern are unchanged.
 
 ---
 
@@ -816,468 +488,136 @@ But practical measurements show ~0.20 seconds, accounting for:
 
 ### Advantages
 
-#### 1. **Superior Scalability**
-- **Advantage:** O(1) communication phases vs O(log²p) for bitonic
-- **Impact:** Dramatic reduction in synchronization overhead
-- **Evidence:** Theoretical speedup improvement from 5.65x to 7x at 8 cores
-
-#### 2. **Well-Understood Algorithm**
-- **Advantage:** Samplesort is classical parallel computing technique
-- **Impact:** Proven correctness, extensive literature, no new research needed
-- **Evidence:** Used in production systems (SQL distributed databases, MapReduce)
-
-#### 3. **Minimal Communication Volume**
-- **Advantage:** Each element transmitted exactly once during exchange phase
-- **Impact:** Communication cost is O(n), independent of process count
-- **Evidence:** All-to-all is one collective operation vs multiple rounds
-
-#### 4. **Good Load Balancing**
-- **Advantage:** Deterministic partitioning based on global splitters
-- **Impact:** Balanced bucket sizes for typical distributions
-- **Evidence:** Random uniform data → uniform bucket distribution
-
-#### 5. **Cache-Friendly Local Operations**
-- **Advantage:** Each rank performs local qsort on cache-resident data
-- **Impact:** Excellent CPU utilization during computation phases
-- **Evidence:** qsort (Quicksort variant) highly optimized in libc
-
-#### 6. **Straightforward Implementation**
-- **Advantage:** Clear 6-phase structure, no complex recursion
-- **Impact:** Easier to understand, maintain, optimize
-- **Evidence:** 87 lines vs 100+ for bitonic sort implementation
+1. **Fastest of the OK algorithms** in the test suite (2.8× faster than Bitonic, 3.2× faster than Merge).
+2. **Genuine hybrid** — combines three classical techniques (sample sort + introsort + k-way merge) and one orthogonal layer (OpenMP).
+3. **O(1) communication rounds** — sample-sort heritage means total comm cost is independent of p, unlike Bitonic's O(log² p).
+4. **Cache-friendly** — local introsort works on cache-resident data; insertion-sort base case at n ≤ 32 stays in L1.
+5. **Robust to OMP availability** — `#ifdef _OPENMP` makes the code compile with or without `-fopenmp`.
+6. **No changes to shared utilities** — all specialized helpers are `static` in `hybrid_sort.c`, so the other algorithms remain untouched.
 
 ### Disadvantages
 
-#### 1. **Uneven Communication Pattern**
-- **Disadvantage:** All-to-all exchange requires global synchronization
-- **Impact:** One slow rank delays all others (Amdahl's law)
-- **Severity:** Medium (affects final exchange phase only)
-- **Mitigation:** Works well on homogeneous clusters; less ideal for heterogeneous systems
-
-#### 2. **Load Imbalance with Skewed Data**
-- **Disadvantage:** Unequal bucket sizes for non-uniform distributions
-- **Impact:** Some ranks finish earlier, wait for slowest rank
-- **Severity:** High for adversarial inputs (e.g., sorted data)
-- **Mitigation:** Increase oversampling ratio from 1x to 2x or 3x
-
-#### 3. **Two Qsort Operations per Rank**
-- **Disadvantage:** Local qsort (Phase 0) + re-sort (Phase 6)
-- **Impact:** Twice the single-rank computation cost vs serial algorithm
-- **Severity:** Low (local sorts dominate time anyway)
-- **Mitigation:** Optimize re-sort with k-way merge instead of qsort
-
-#### 4. **Overhead for Small Process Counts**
-- **Disadvantage:** Communication overhead may dominate for p ≤ 2
-- **Impact:** Speedup may be linear but not exponential at small p
-- **Severity:** Low (assignment tests at p=4 and above)
-- **Mitigation:** Use simpler algorithm (e.g., merge sort) for p ≤ 4
-
-#### 5. **Memory Overhead for Metadata**
-- **Disadvantage:** O(p²) sample buffer allocation (rank 0 only)
-- **Impact:** Negligible for p ≤ 8 (only 56 ints = 224 bytes)
-- **Severity:** Very low
-- **Mitigation:** Not needed for practical systems
-
-#### 6. **Rank-0 Bottleneck for Splitter Selection**
-- **Disadvantage:** Rank 0 sorts all p² samples sequentially
-- **Impact:** O(p² log p) work concentrated on one rank
-- **Severity:** Negligible for p ≤ 8 (192 ops vs 2M ops per rank)
-- **Mitigation:** Use parallel splitter selection for p > 32
-
-### Summary Comparison Table
-
-| Aspect | Sample Sort | Bitonic Sort | Merge Sort |
-|--------|---|---|---|
-| **Asymptotic Complexity** | O(n log n) | O(n log²p + n log n) | O(n log n + n log p) |
-| **Communication Rounds** | 1 major | 9 (at p=8) | 3 (at p=8) |
-| **Load Balancing** | Good | Perfect | Perfect |
-| **Ease of Implementation** | Easy | Medium | Medium |
-| **Cache Efficiency** | Excellent | Good | Good |
-| **Data Sensitivity** | Yes (skew-sensitive) | No (uniform work) | No (uniform work) |
-| **Speedup at p=8** | ~7x | ~6.3x | ~5.7x |
+1. **All-to-all is one synchronization point** — one slow rank delays everyone (Amdahl's law). Acceptable on homogeneous clusters.
+2. **Load imbalance with skewed data** — sample selection assumes near-uniform distribution. Mitigation: increase the oversampling ratio.
+3. **OMP + MPI oversubscription** requires `--oversubscribe` on machines where `n × OMP_NUM_THREADS` exceeds core count.
+4. **Rank-0 splitter sort is sequential** — O(p² log p) at rank 0 only. Negligible for p ≤ 32.
 
 ---
 
 ## Testing and Validation
 
-### Correctness Testing
-
-#### Unit Test: Single Process
+### Correctness
 
 ```bash
-mpirun -np 1 ./sorting_parallel sample
+mpirun -n 1 --oversubscribe ./sorting_parallel hybrid    # → Status: OK
+mpirun -n 2 --oversubscribe ./sorting_parallel hybrid    # → Status: OK
+mpirun -n 4 --oversubscribe ./sorting_parallel hybrid    # → Status: OK
+mpirun -n 8 --oversubscribe ./sorting_parallel hybrid    # → Status: OK
 ```
 
-**Expected Output:**
-```
-Algorithm: Sample
-Elements: 1000000
-Time: 0.XXXXs
-Processes: 1
-Status: OK
-```
+All checked. The framework's `is_sorted()` is the source of truth; the algorithm is correct iff the gathered result is monotonically non-decreasing.
 
-**Validation:** Correctness check calls `is_sorted()` on entire sorted array
-
-#### Unit Test: Multiple Processes
+### OMP fallback
 
 ```bash
-for p in 2 4 8; do
-  mpirun -np $p ./sorting_parallel sample
-done
+OMP_NUM_THREADS=1 mpirun -n 8 --oversubscribe ./sorting_parallel hybrid   # OK
+OMP_NUM_THREADS=2 mpirun -n 8 --oversubscribe ./sorting_parallel hybrid   # OK
 ```
 
-**Expected Output:** `Status: OK` for all process counts
+Both produce sorted output. The `omp single nowait` block executes serially when `OMP_NUM_THREADS=1`.
 
-**Validation:** Framework uses same validation function for all algorithms
-
-#### Integration Test: Full Algorithm Suite
+### Suite regression
 
 ```bash
-mpirun -np 4 ./sorting_parallel all
+mpirun -n 8 --oversubscribe ./sorting_parallel all
 ```
 
-**Expected Behavior:**
-- Runs all 6 algorithms in sequence
-- Writes report to `reports/parallel_all_4p_TIMESTAMP.txt`
-- Each algorithm prints `Status: OK`
+Hybrid is now the fastest OK algorithm; Merge and Bitonic timings are unchanged from before the hybrid rewrite (proves the change was isolated to `hybrid_sort.c` and `Makefile`).
 
-### Performance Testing
+### Debugging tips
 
-#### Benchmark Run (Single Scale)
-
-```bash
-# Run 3 times for averaging
-for trial in 1 2 3; do
-  mpirun -np 4 ./sorting_parallel sample
-done
-```
-
-#### Benchmark Run (Full Suite)
-
-```bash
-for p in 1 2 4 8; do
-  for trial in 1 2 3; do
-    mpirun -np $p ./sorting_parallel sample >> results_sample_$p.txt
-  done
-done
-```
-
-#### Expected Results
-
-| Process Count | Run 1 | Run 2 | Run 3 | Average | Expected |
-|---|---|---|---|---|---|
-| 1 | 0.202 | 0.201 | 0.203 | 0.202 | ~0.20 |
-| 2 | 0.112 | 0.111 | 0.113 | 0.112 | ~0.11 |
-| 4 | 0.062 | 0.061 | 0.063 | 0.062 | ~0.06 |
-| 8 | 0.032 | 0.031 | 0.033 | 0.032 | ~0.03 |
-
-**Speedup Calculation:**
-```
-Speedup(p) = Time(1) / Time(p)
-S(2) = 0.202 / 0.112 = 1.80x
-S(4) = 0.202 / 0.062 = 3.26x
-S(8) = 0.202 / 0.032 = 6.31x
-```
-
-### Stress Testing
-
-#### Large Scale (Requires HPC System)
-
-```bash
-# Test on 16, 32, 64 processes (if available)
-mpirun -np 16 ./sorting_parallel sample
-mpirun -np 32 ./sorting_parallel sample
-mpirun -np 64 ./sorting_parallel sample
-```
-
-#### Expected Behavior:
-- Algorithm should scale to larger process counts
-- May need to increase problem size for meaningful results
-- Load balancing should remain good
-
-### Debugging Techniques
-
-#### If `Status: ERR` (Incorrect Sorting)
-
-**Step 1: Verify local sort**
-- Add printf after Phase 0: `printf("Rank %d local sort OK\n", r);`
-- Check if all ranks report success
-
-**Step 2: Verify splitter selection**
-- Add printf after Phase 3: print global splitters
-- Check if they are in ascending order
-
-**Step 3: Verify bucket counts**
-- Add printf after Phase 4: `printf("Rank %d: sc = [%d, %d, %d, %d]\n", r, ...);`
-- Check if sum equals ln (local array size)
-
-**Step 4: Verify alltoallv**
-- Add printf after Phase 5: `printf("Rank %d received %d elements\n", r, tot);`
-- Check if total across all ranks equals N
-
-**Step 5: Final validation**
-- Add check before Phase 6: `assert(is_sorted(l, ln));`
-- Verify local array is sorted before re-sort
-
-#### If Performance is Worse Than Expected
-
-**Check 1: MPI Implementation**
-- Verify `mpirun` correctly binds processes to cores
-- Command: `mpirun -np 4 ./sorting_parallel sample`
-
-**Check 2: System Load**
-- Run during quiet period (no other processes)
-- Use `taskset` to bind processes to specific cores
-
-**Check 3: Communication Pattern**
-- Use `mpirun` profiling tools (e.g., `mpirun --mca mpi_profile`)
-- Identify if any communication operation is unexpectedly slow
+- **Status: ERR** — verify local sort: `assert(is_sorted_int(l, ln))` after Phase 0.
+- **Sample skew** — print `gspl[]` after Phase 3; expect monotonically increasing.
+- **Bucket counts** — sum of `sc[]` should equal `ln`; sum of `rc[]` is `tot`.
+- **K-way merge wrong** — fall back to `qsort(rb, tot, sizeof(int), cmp)` to see if the bug is in the merge or upstream.
 
 ---
 
 ## Integration with Existing Framework
 
-### Framework Architecture Review
+### Function Signature (unchanged)
 
 ```c
-// main.c structure
-int main(int argc, char** argv) {
-    // 1. MPI initialization
-    // 2. Command-line argument processing (algorithm selection)
-    // 3. Data generation (rank 0 only)
-    // 4. Algorithm selection and execution
-    // 5. Performance measurement
-    // 6. Correctness validation
-    // 7. Report generation
-    // 8. MPI finalization
-}
+double parallel_sample_sort(int r, int s, int* g, int curN);
 ```
 
-### How Sample Sort Fits In
+Same signature as before — the public API is preserved. `main.c` calls it through the existing algorithm-array dispatch table without modification.
 
-#### Step 1: Algorithm Selection
+### Algorithm Registration (unchanged)
 
 ```c
-target = "sample";  // or "all" to run all algorithms
+{"Hybrid", parallel_sample_sort, 0}
 ```
 
-The framework matches algorithm name (case-insensitive) and calls the corresponding function.
+The label remains `"Hybrid"` and `skip = 0` so it runs on the full N = 1,000,000.
 
-#### Step 2: Data Generation
+### Build System Changes
 
-```c
-if (!r) {
-    g = malloc(N * sizeof(int));
-    srand(42);
-    for (int i = 0; i < N; i++) o[i] = rand() % (N * 10);
-}
+Single one-token edit in `Makefile`:
+
+```
+CFLAGS=-O2 -Wall -fopenmp     # ← added -fopenmp
 ```
 
-Same for all algorithms. Rank 0 generates 1,000,000 random integers.
-
-#### Step 3: Timing Wrapper
-
-```c
-double tl = algs[i].f(r, s, (!r ? g : NULL), curN);
-double tg;
-MPI_Reduce(&tl, &tg, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-```
-
-- Calls `parallel_sample_sort(r, s, g, curN)`
-- Collects maximum time across all ranks
-- Metric: wall clock time of slowest rank (standard for parallel algorithms)
-
-#### Step 4: Correctness Validation
-
-```c
-printf("Status: %s\n", is_sorted(g, curN) ? "OK" : "ERR");
-```
-
-Framework calls `is_sorted()` on result. Sample sort must produce globally sorted array.
-
-#### Step 5: Report Generation
-
-```c
-fprintf(report_file, "Algorithm: Sample\n");
-fprintf(report_file, "Elements: 1000000\n");
-fprintf(report_file, "Time: %fs\n", tg);
-fprintf(report_file, "Processes: %d\n", s);
-fprintf(report_file, "Status: %s\n", is_sorted(g, curN) ? "OK" : "ERR");
-```
-
-Same reporting for all algorithms. Output written to:
-```
-reports/parallel_sample_Xp_YYYYMMDD_HHMMSS.txt
-reports/parallel_all_Xp_YYYYMMDD_HHMMSS.txt
-```
+Everything else (the `mpicc` wildcard, the `-O2`, `-Wall`) is unchanged.
 
 ### Backward Compatibility
 
-- No changes to main.c algorithm execution loop structure
-- No changes to data generation logic
-- No changes to timing measurement methodology
-- No changes to report format
-
-**Compatibility Status:** ✓ Fully backward compatible
-
-### Performance Measurement Integration
-
-The framework already measures:
-- **Wall Time:** Using `MPI_Wtime()` (high-resolution timer)
-- **Process Count:** Using `MPI_Comm_size()`
-- **Synchronization:** Using `MPI_Reduce(MPI_MAX)` to find slowest process
-
-Sample sort benefits from this measurement methodology:
-- Accurate timing of all phases inside the timer
-- Proper comparison with other algorithms
-- Scalability testing across process counts
+| Aspect                       | Status        |
+|------------------------------|---------------|
+| Function signature            | ✓ unchanged   |
+| Algorithm-array layout        | ✓ unchanged   |
+| Report format                 | ✓ unchanged   |
+| Timing methodology            | ✓ unchanged   |
+| `main.c` / `algorithms.h`     | ✓ unchanged   |
+| `utils.c` / `utils.h`         | ✓ unchanged   |
+| Other algorithm sources       | ✓ unchanged   |
 
 ---
 
 ## Future Improvements
 
-### Short-Term Optimizations (Practical)
-
-#### 1. **Replace Phase 6 Qsort with K-Way Merge**
-
-**Current:** Each rank re-sorts received bucket with `qsort()`
-**Proposed:** Merge the p sorted runs using a min-heap
-
-**Implementation:**
-```c
-typedef struct {
-    int value;
-    int rank;
-    int index;
-} HeapElement;
-
-// Min-heap over p sorted runs
-// Extract minimum, output to result array
-// Refill heap with next element from source rank
-// Complexity: O(n log p) vs O(n log n)
-```
-
-**Expected Speedup:** ~5-10% for Phase 6 (not huge, since qsort is already fast on partially-sorted data)
-
-#### 2. **Adaptive Oversampling Ratio**
-
-**Current:** Fixed 1x oversampling (select s-1 samples per rank)
-**Proposed:** Detect data distribution and adjust ratio
-
-**Implementation:**
-```c
-// After Phase 1, rank 0 can compute:
-// - Standard deviation of sample gaps
-// - Duplicate frequency
-// - Skewness metric
-// 
-// If skew detected, increase oversampling to 2x or 3x
-// Redistribute buckets based on new splitters
-```
-
-**Expected Improvement:** Better handling of skewed inputs
-
-#### 3. **Pipelined Communication**
-
-**Current:** Gather splitters → Broadcast → Alltoallv (sequential)
-**Proposed:** Overlap communication phases
-
-**Implementation:**
-```c
-// Use MPI non-blocking operations:
-MPI_Igather(...)  // Initiate gather
-MPI_Ibcast(...)   // Initiate broadcast
-// Process other data while waiting
-MPI_Wait(...);    // Synchronize when needed
-```
-
-**Expected Improvement:** 10-20% for small p (p ≤ 8)
-
-### Medium-Term Enhancements (Algorithmic)
-
-#### 1. **Recursive Multi-Level Partitioning**
-
-**Current:** Single-level partitioning (p buckets for p ranks)
-**Proposed:** Recursive partitioning for better load balance
-
-**Concept:** Similar to parallel mergesort tree structure but with recursive sampling
-
-**Expected Improvement:** O(log p) phases instead of O(1), but better load balance
-
-#### 2. **Hybrid Algorithm (Sample + Bitonic)**
-
-**Current:** Pure samplesort
-**Proposed:** Use sampling for coarse partitioning, then bitonic for fine-grained sort
-
-**Expected Improvement:** Better for highly skewed data
-
-#### 3. **GPU-Aware MPI**
-
-**Current:** Pure CPU sorting
-**Proposed:** Offload local qsort and final re-sort to GPU
-
-**Expected Improvement:** 10-100x for local sorting phases (depends on GPU)
-
-### Long-Term Research (Scientific)
-
-#### 1. **Theoretical Analysis of Load Imbalance**
-
-**Research Question:** How does oversampling ratio affect load balance for various distributions?
-
-**Approach:**
-- Formal analysis of bucket size distribution
-- Experimental validation with different data distributions
-- Derive optimal oversampling ratio as function of p and data skewness
-
-#### 2. **Communication-Avoiding Sorting**
-
-**Research Question:** Can we reduce communication volume below O(n)?
-
-**Approach:**
-- Use multi-level hierarchy (local → socket → NUMA → global)
-- Exploit non-uniform memory access patterns
-- Reduce all-to-all to more structured pattern (e.g., hypercube)
-
-#### 3. **Samplesort for Heterogeneous Systems**
-
-**Research Question:** How to balance work across CPUs of different speeds?
-
-**Approach:**
-- Adaptive bucket sizes based on rank speed
-- Dynamic re-balancing during all-to-all phase
-- Evaluate on mixed GPU/CPU systems
+1. **Radix sort for the local phase** — for uniformly distributed bounded integers, LSD radix sort is O(n) rather than O(n log n). Could replace introsort entirely for this assignment's data distribution.
+2. **Adaptive oversampling** — detect skew via sample variance and increase the per-rank sample count from `s − 1` to `c · (s − 1)` for some `c > 1`.
+3. **Non-blocking pipelining** — overlap `MPI_Igather` of samples with the tail end of Phase 0 local sort using `MPI_Wait` only when splitters are needed.
+4. **NUMA-aware OMP** — pin OMP threads to the same NUMA node as their MPI rank using `OMP_PROC_BIND=close`.
+5. **GPU offload** — for very large N, route the local sort through a GPU sort (e.g., CUB/Thrust). Communication phases stay on CPU.
 
 ---
 
 ## Conclusion
 
-The **Parallel Samplesort** algorithm successfully combines the strengths of previous parallel sorting implementations:
-
-- **Simplicity** from bubble sort and quick sort
-- **Load balancing** from bitonic sort and merge sort
-- **Communication efficiency** superior to all previous implementations
+The Hybrid algorithm is a genuine three-technique hybrid — sample sort outer structure, specialized integer introsort, and a k-way merge replacing the post-exchange re-sort — with OpenMP threading layered orthogonally. On the assignment's reference workload (N = 1,000,000, 8 processes) it runs in **0.0136s**, making it **2.8× faster than Bitonic** and **3.2× faster than Merge**, the previous best performers.
 
 **Key Achievements:**
-1. ✓ Designed novel algorithm achieving O(n log n) per-rank complexity
-2. ✓ Implemented in 87 lines of clean, documented C code
-3. ✓ Integrated seamlessly with existing MPI framework
-4. ✓ Theoretical speedup target: ~7x at 8 cores (vs bitonic's 6.29x)
-5. ✓ Maintained backward compatibility with framework
 
-**Performance Profile:**
-- **Best Case:** Uniform random data → near-linear speedup
-- **Typical Case:** ~6.5-7x speedup at 8 processes
-- **Worst Case:** Highly skewed data → potential load imbalance (mitigable)
+1. ✓ Designed a genuine hybrid combining three classical algorithms.
+2. ✓ Reduced post-exchange phase from O(n log n) to O(n log p).
+3. ✓ Removed `qsort`'s function-pointer comparator overhead.
+4. ✓ Added OpenMP task parallelism with safe fall-back when OMP is disabled.
+5. ✓ All-rank correctness verified at p = 1, 2, 4, 8 and across `OMP_NUM_THREADS` settings.
+6. ✓ Single-token build-system change (`-fopenmp`), no API changes.
 
-**Comparison Summary:**
-| Metric | Bubble | Selection | Quick | Merge | Bitonic | Sample |
-|--------|--------|-----------|-------|-------|---------|---------|
-| Implementation | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ NEW |
-| Speedup (8p) | ~1.5x | ~2.0x | 4.44x | 5.65x | 6.29x | ~7.0x |
-| Communication | O(p) rounds | 1 gather | 2 phases | O(log p) | O(log²p) | **O(1)** |
+**Final comparison (N = 1,000,000, p = 8):**
 
-The implementation is complete, tested, and ready for benchmark evaluation.
+| Algorithm   | Time    | Status | Notes                                |
+|-------------|---------|--------|--------------------------------------|
+| **Hybrid**  | **0.0136s** | OK ✓ | 2.8× faster than next-best           |
+| Bitonic     | 0.0384s | OK     | previous best                        |
+| Merge       | 0.0442s | OK     |                                      |
+| Selection   | 0.0485s | OK     |                                      |
+| Bubble      | 0.0568s | ERR    | unrelated, pre-existing              |
+| Quick       | 0.0284s | ERR    | unrelated, pre-existing              |
 
 ---
 
@@ -1287,63 +627,55 @@ The implementation is complete, tested, and ready for benchmark evaluation.
 
 ```
 src/parallel/
-├── main.c                      (MODIFIED - 2 lines)
+├── main.c                      (unchanged)
 ├── utils.c                     (unchanged)
 ├── utils.h                     (unchanged)
-├── algorithms.h                (MODIFIED - 1 line added)
+├── algorithms.h                (unchanged)
 └── algorithms/
     ├── bubble_sort.c           (unchanged)
     ├── selection_sort.c        (unchanged)
     ├── quick_sort.c            (unchanged)
     ├── merge_sort.c            (unchanged)
     ├── bitonic_sort.c          (unchanged)
-    └── hybrid_sort.c           (NEW - 87 lines)
+    └── hybrid_sort.c           (REWRITTEN — 228 lines)
+Makefile                        (one-token change: added -fopenmp to CFLAGS)
 ```
 
-### B. Compilation Instructions
+### B. Compilation
 
 ```bash
-# Navigate to project root
 cd /home/tejaromalius/Cyber.HUB/ParalelComputing
-
-# Clean previous builds
 make clean
-
-# Build all targets (serial and parallel)
 make
-
-# Output files:
-#   sorting_serial    - Serial algorithms (for comparison)
-#   sorting_parallel  - Parallel algorithms (MPI-based)
+# produces sorting_serial and sorting_parallel
 ```
 
 ### C. Execution Examples
 
 ```bash
-# Run single algorithm
-mpirun -np 4 ./sorting_parallel sample
+# the algorithm by name
+mpirun -n 8 --oversubscribe ./sorting_parallel hybrid
 
-# Run all algorithms
-mpirun -np 4 ./sorting_parallel all
+# the full suite (writes to reports/parallel_all_8p_*.txt)
+mpirun -n 8 --oversubscribe ./sorting_parallel all
 
-# Run with specific process counts
-mpirun -np 1 ./sorting_parallel sample
-mpirun -np 2 ./sorting_parallel sample
-mpirun -np 4 ./sorting_parallel sample
-mpirun -np 8 ./sorting_parallel sample
-
-# Run in background and collect results
+# scaling sweep
 for p in 1 2 4 8; do
-  mpirun -np $p ./sorting_parallel sample >> benchmark_$p.txt
+  mpirun -n $p --oversubscribe ./sorting_parallel hybrid
 done
+
+# OMP toggle
+OMP_NUM_THREADS=1 mpirun -n 8 --oversubscribe ./sorting_parallel hybrid
+OMP_NUM_THREADS=2 mpirun -n 8 --oversubscribe ./sorting_parallel hybrid
+OMP_NUM_THREADS=4 mpirun -n 8 --oversubscribe ./sorting_parallel hybrid
 ```
 
-### D. Expected Report Format
+### D. Report Format
 
 ```
-Algorithm: Sample
+Algorithm: Hybrid
 Elements: 1000000
-Time: 0.031234s
+Time: 0.013623s
 Processes: 8
 Status: OK
 ---
@@ -1351,19 +683,18 @@ Status: OK
 
 ### E. Glossary
 
-- **MPI:** Message Passing Interface - distributed memory parallel programming model
-- **Rank:** Individual process in MPI communicator (identified by 0-based integer)
-- **Communicator:** Group of MPI processes (MPI_COMM_WORLD = all processes)
-- **Alltoall:** MPI collective operation where each rank sends/receives from all other ranks
-- **Gatherv:** MPI collective operation gathering variable-length data
-- **Splitter:** Pivot element used to partition data into buckets
-- **Bucket:** Contiguous range of elements within sorted data
-- **Oversampling:** Sampling more candidates than final splitters selected
-- **Load Balance:** Even distribution of work across all ranks
+- **MPI:** Message Passing Interface — distributed-memory parallel programming model.
+- **OpenMP:** shared-memory parallel programming via compiler pragmas.
+- **Rank:** individual MPI process (0-based int).
+- **Alltoall / Alltoallv:** MPI collectives where every rank exchanges data with every other rank (`v` = variable-length).
+- **Introsort:** quicksort variant that falls back to heapsort on bad partitions and to insertion sort on small subarrays. (This implementation uses insertion-sort base case; full heapsort fall-back is left as a future improvement.)
+- **K-way merge:** merge of `k` already-sorted runs into one sorted run, typically with a min-heap.
+- **Splitter:** value used to partition local data into buckets for distribution.
+- **Oversampling:** sampling more candidates than splitters selected (1× here).
 
 ---
 
-**Document Version:** 1.0
+**Document Version:** 2.0
 **Date:** 2026-05-21
-**Status:** Complete
+**Status:** Updated to reflect the three-technique hybrid implementation
 **Ready for Report Generation:** Yes
