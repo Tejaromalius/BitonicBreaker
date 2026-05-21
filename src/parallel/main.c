@@ -46,12 +46,12 @@ int main(int argc, char** argv) {
     const char* n;
     double (*f)(int, int, int*, int);
     int skip;
-  } algs[] = {{"Bubble", parallel_bubble_sort, 1},
-              {"Selection", parallel_selection_sort, 1},
+  } algs[] = {{"Bubble", parallel_bubble_sort, 0},
+              {"Selection", parallel_selection_sort, 0},
               {"Quick", parallel_quick_sort, 0},
               {"Merge", parallel_merge_sort, 0},
               {"Bitonic", parallel_bitonic_sort, 0},
-              {"Sample", parallel_sample_sort, 0}};
+              {"Hybrid", parallel_sample_sort, 0}};
 
   FILE *report_file = NULL;
   char report_filename[100];
@@ -91,39 +91,47 @@ int main(int argc, char** argv) {
         report_file = fopen(report_filename, "a");
       }
 
-      if (algs[i].skip) {
-        printf("Algorithm: %s\n", algs[i].n);
-        printf("Elements: %d (Extrapolated to %d)\n", curN, N);
-        printf("Time: %fs\n", tg);
-        printf("Extrapolated Time: %fs\n", tg * 100.0);
-        printf("Processes: %d\n", s);
-        printf("Status: %s\n---\n", is_sorted(g, curN) ? "OK" : "ERR");
+      if (report_file) {
+        if (algs[i].skip) {
+          printf("Algorithm: %s\n", algs[i].n);
+          printf("Elements: %d (Extrapolated to %d)\n", curN, N);
+          printf("Time: %fs\n", tg);
+          printf("Extrapolated Time: %fs\n", tg * 100.0);
+          printf("Processes: %d\n", s);
+          printf("Status: %s\n---\n", is_sorted(g, curN) ? "OK" : "ERR");
 
-        fprintf(report_file, "Algorithm: %s\n", algs[i].n);
-        fprintf(report_file, "Elements: %d (Extrapolated to %d)\n", curN, N);
-        fprintf(report_file, "Time: %fs\n", tg);
-        fprintf(report_file, "Extrapolated Time: %fs\n", tg * 100.0);
-        fprintf(report_file, "Processes: %d\n", s);
-        fprintf(report_file, "Status: %s\n---\n", is_sorted(g, curN) ? "OK" : "ERR");
+          fprintf(report_file, "Algorithm: %s\n", algs[i].n);
+          fprintf(report_file, "Elements: %d (Extrapolated to %d)\n", curN, N);
+          fprintf(report_file, "Time: %fs\n", tg);
+          fprintf(report_file, "Extrapolated Time: %fs\n", tg * 100.0);
+          fprintf(report_file, "Processes: %d\n", s);
+          fprintf(report_file, "Status: %s\n---\n", is_sorted(g, curN) ? "OK" : "ERR");
+        } else {
+          printf("Algorithm: %s\n", algs[i].n);
+          printf("Elements: %d\n", curN);
+          printf("Time: %fs\n", tg);
+          printf("Processes: %d\n", s);
+          printf("Status: %s\n---\n", is_sorted(g, curN) ? "OK" : "ERR");
+
+          fprintf(report_file, "Algorithm: %s\n", algs[i].n);
+          fprintf(report_file, "Elements: %d\n", curN);
+          fprintf(report_file, "Time: %fs\n", tg);
+          fprintf(report_file, "Processes: %d\n", s);
+          fprintf(report_file, "Status: %s\n---\n", is_sorted(g, curN) ? "OK" : "ERR");
+        }
+
+        fflush(report_file);
+
+        if (strcmp(target, "all") != 0) {
+          fclose(report_file);
+          report_file = NULL;
+        }
       } else {
         printf("Algorithm: %s\n", algs[i].n);
         printf("Elements: %d\n", curN);
         printf("Time: %fs\n", tg);
         printf("Processes: %d\n", s);
         printf("Status: %s\n---\n", is_sorted(g, curN) ? "OK" : "ERR");
-
-        fprintf(report_file, "Algorithm: %s\n", algs[i].n);
-        fprintf(report_file, "Elements: %d\n", curN);
-        fprintf(report_file, "Time: %fs\n", tg);
-        fprintf(report_file, "Processes: %d\n", s);
-        fprintf(report_file, "Status: %s\n---\n", is_sorted(g, curN) ? "OK" : "ERR");
-      }
-
-      fflush(report_file);
-
-      if (strcmp(target, "all") != 0) {
-        fclose(report_file);
-        report_file = NULL;
       }
     }
   }
