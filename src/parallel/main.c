@@ -46,12 +46,13 @@ int main(int argc, char** argv) {
     const char* n;
     double (*f)(int, int, int*, int);
     int skip;
-  } algs[] = {{"Bubble", parallel_bubble_sort, 0},
+  } algs[] = {{"Bubble",  parallel_bubble_sort,    0},
               {"Selection", parallel_selection_sort, 0},
-              {"Quick", parallel_quick_sort, 0},
-              {"Merge", parallel_merge_sort, 0},
-              {"Bitonic", parallel_bitonic_sort, 0},
-              {"Hybrid", parallel_sample_sort, 0}};
+              {"Quick",   parallel_quick_sort,      0},
+              {"Merge",   parallel_merge_sort,      0},
+              {"Bitonic", parallel_bitonic_sort,    0},
+              {"Sample",  parallel_sample_sort,     0},
+              {"Bucket",  parallel_bucket_sort,     0}};
 
   FILE *report_file = NULL;
   char report_filename[100];
@@ -62,7 +63,7 @@ int main(int argc, char** argv) {
     report_file = fopen(report_filename, "a");
   }
 
-  for (int i = 0; i < 6; i++) {
+  for (int i = 0; i < 7; i++) {
     char name[20];
     strcpy(name, algs[i].n);
     for(int j = 0; name[j]; j++) name[j] = tolower(name[j]);
